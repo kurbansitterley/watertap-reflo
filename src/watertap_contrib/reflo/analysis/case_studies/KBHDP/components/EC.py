@@ -65,7 +65,7 @@ __all__ = [
 ]
 
 
-def propagate_state(arc, detailed=True):
+def propagate_state(arc, detailed=False):
     _prop_state(arc)
     if detailed:
         print(f"Propogation of {arc.source.name} to {arc.destination.name} successful.")
@@ -243,7 +243,7 @@ def init_system(m, solver=None):
 
 
 def init_ec(m, blk, solver=None):
-    """Initialize IX model"""
+    """Initialize EC model"""
 
     if solver is None:
         solver = get_solver()

@@ -16,7 +16,6 @@ from pyomo.environ import (
     RangeSet,
     check_optimal_termination,
     units as pyunits,
-    SolverFactory,
 )
 from pyomo.network import Arc, SequentialDecomposition
 from pyomo.util.check_units import assert_units_consistent
@@ -60,11 +59,11 @@ __all__ = [
     "build_system",
     "add_connections",
     "add_costing",
-    "add_system_costing",
-    "set_inlet_conditions",
+    "apply_scaling",
     "set_operating_conditions",
     "init_system",
     "print_results_summary",
+    "solve",
 ]
 
 __location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
@@ -76,7 +75,99 @@ def propagate_state(arc):
     _prop_state(arc)
 
 
-def build_system(Qin=4, Cin=12, water_recovery=0.5):
+def main(
+        water_recovery=0.8,
+        heat_price=0.01,
+        electricity_price=0.07,
+        grid_frac_heat=0.5,
+        hours_storage=8,
+        cost_per_area_collector=600,
+        cost_per_volume_storage=2000,
+        dwi_lcow=None
+        ):
+    
+    m = build_system(grid_frac_heat, water_recovery=water_recovery)
+
+    add_connections(m)
+    set_operating_conditions(m,hours_storage=hours_storage)
+    apply_scaling(m)
+    init_system(m, m.fs)
+
+    # m.fs.energy.FPC.heat_load.unfix()
+    _ = solve(m.fs.treatment.md, tee=False)
+    _ = solve(m, raise_on_failure=False, tee=False)
+    
+    # m.fs.energy.FPC.heat_load.fix()
+   
+    # _ = solve(m)
+
+    report_MD(m, m.fs.treatment.md)
+
+    if grid_frac_heat == 1:
+        add_treatment_only_costing(m,heat_price=heat_price, electricity_price=electricity_price)
+        _ = solve(m)
+
+        m.fs.energy.FPC.heat_load.unfix()
+        m.fs.costing.frac_heat_from_grid.fix(0.95)
+
+        if dwi_lcow!= None:
+            m.fs.treatment.costing.deep_well_injection.dwi_lcow.set_value(dwi_lcow)
+
+        results = solve(m)
+
+        # Update fs.costing block results for only treatment costs
+        # Update total heat/electric operating to be treatment aggregate_flow_costs
+        m.fs.costing.total_heat_operating_cost = m.fs.treatment.costing.aggregate_flow_costs['heat']
+        m.fs.costing.total_electric_operating_cost = m.fs.treatment.costing.aggregate_flow_costs['electricity']
+        
+        # Update the total_capital, total_operating
+        m.fs.energy.FPC.costing.capital_cost.fix(1e-5)
+        m.fs.energy.FPC.costing.fixed_operating_cost.fix(1e-5)
+
+        # Update LCOT to be LCOW
+        m.fs.costing.LCOT.fix(m.fs.treatment.costing.LCOW())
+
+        m.fs.costing.frac_heat_from_grid.fix(1)
+
+
+    else:
+        add_costing(m,heat_price=heat_price, electricity_price=electricity_price)
+        _ = solve(m)
+
+        m.fs.lcot_objective = Objective(expr=m.fs.costing.LCOT)
+
+        m.fs.energy.FPC.heat_load.unfix()
+        m.fs.costing.frac_heat_from_grid.fix(grid_frac_heat)
+
+        m.fs.energy.costing.flat_plate.cost_per_area_collector.fix(cost_per_area_collector)
+        m.fs.energy.costing.flat_plate.cost_per_volume_storage.fix(cost_per_volume_storage)
+
+        if dwi_lcow!= None:
+            m.fs.treatment.costing.deep_well_injection.dwi_lcow.set_value(dwi_lcow)
+
+        results = solve(m)
+
+
+    # For reporting purposes
+    m.fs.treatment.md.unit.capital_cost = Param(
+        initialize=value(m.fs.treatment.md.unit.costing.capital_cost), mutable=True
+    )
+    m.fs.treatment.md.unit.fixed_operating_cost = Param(
+        initialize=value(m.fs.treatment.md.unit.costing.fixed_operating_cost), mutable=True
+    )
+    m.fs.treatment.md.unit.module_cost = Param(
+        initialize=value(m.fs.treatment.md.unit.costing.module_cost), mutable=True
+    )
+    m.fs.treatment.md.unit.other_capital_cost = Param(
+        initialize=value(m.fs.treatment.md.unit.costing.other_capital_cost), mutable=True
+    )
+
+    
+    
+    return m
+
+
+def build_system(grid_frac_heat, Qin=4, Cin=12, water_recovery=0.5):
 
     m = ConcreteModel()
     m.fs = FlowsheetBlock()
@@ -90,6 +181,9 @@ def build_system(Qin=4, Cin=12, water_recovery=0.5):
         Cin * pyunits.g / pyunits.liter, to_units=pyunits.kg / pyunits.m**3
     )
     m.water_recovery = water_recovery
+    m.fs.water_recovery =  Param(
+        initialize=water_recovery, mutable=True
+    )
 
     m.fs.treatment.costing = TreatmentCosting()
     m.fs.energy.costing = EnergyCosting()
@@ -105,14 +199,11 @@ def build_system(Qin=4, Cin=12, water_recovery=0.5):
     # Create MD unit model at flowsheet level
     m.fs.treatment.md = FlowsheetBlock()
 
-    build_md(
-        m,
-        m.fs.treatment.md,
-    )
+    build_md(m, m.fs.treatment.md)
     m.fs.treatment.dwi = FlowsheetBlock()
     build_DWI(m, m.fs.treatment.dwi, m.fs.properties)
-
-    m.fs.energy.FPC = FlowsheetBlock()
+   
+    # Logic to select the build for FPC
     build_fpc(m)
 
     return m
@@ -137,25 +228,35 @@ def add_connections(m):
 
     TransformationFactory("network.expand_arcs").apply_to(m)
 
+def add_treatment_only_costing(m, heat_price=0.01, electricity_price=0.07, treatment_costing_block=None, energy_costing_block=None):
 
-def add_costing(m, treatment_costing_block=None, energy_costing_block=None):
-    # Solving the system before adding costing
-    # solver = SolverFactory("ipopt")
     if treatment_costing_block is None:
         treatment_costing_block = m.fs.treatment.costing
     if energy_costing_block is None:
         energy_costing_block = m.fs.energy.costing
-    solver = get_solver()
-    solve(m, solver=solver, tee=False)
+
+
     add_fpc_costing(m, costing_block=energy_costing_block)
-    add_md_costing(m.fs.treatment.md.mp, treatment_costing_block)
+
+    m.fs.treatment.md.unit.add_costing_module(treatment_costing_block)
+
     add_DWI_costing(
         m.fs.treatment, m.fs.treatment.dwi, costing_blk=treatment_costing_block
     )
-    # System costing
+    # Treatment costing
+   
+    treatment_costing_block.heat_cost.fix(heat_price)
+    treatment_costing_block.electricity_cost.fix(electricity_price)
     treatment_costing_block.cost_process()
+    treatment_costing_block.add_LCOW(m.fs.treatment.product.properties[0].flow_vol)
+    
+    # Energy costing
     energy_costing_block.cost_process()
+
+    # System costing
     m.fs.costing = REFLOSystemCosting()
+    m.fs.costing.heat_cost_buy.fix(heat_price)
+    m.fs.costing.electricity_cost_buy.set_value(electricity_price)
     m.fs.costing.cost_process()
 
     print("\n--------- INITIALIZING SYSTEM COSTING ---------\n")
@@ -163,6 +264,50 @@ def add_costing(m, treatment_costing_block=None, energy_costing_block=None):
     treatment_costing_block.initialize()
     energy_costing_block.initialize()
     m.fs.costing.initialize()
+
+    m.fs.costing.add_annual_water_production(
+        m.fs.treatment.product.properties[0].flow_vol
+    )
+    m.fs.costing.add_LCOT(m.fs.treatment.product.properties[0].flow_vol)
+    m.fs.costing.add_LCOH()
+    
+
+
+def add_costing(m, heat_price=0.01, electricity_price=0.07, treatment_costing_block=None, energy_costing_block=None):
+
+    if treatment_costing_block is None:
+        treatment_costing_block = m.fs.treatment.costing
+    if energy_costing_block is None:
+        energy_costing_block = m.fs.energy.costing
+
+
+    add_fpc_costing(m, costing_block=energy_costing_block)
+
+    m.fs.treatment.md.unit.add_costing_module(treatment_costing_block)
+
+    add_DWI_costing(
+        m.fs.treatment, m.fs.treatment.dwi, costing_blk=treatment_costing_block
+    )
+    # Treatment costing
+    treatment_costing_block.cost_process()
+
+    treatment_costing_block.add_LCOW(m.fs.treatment.product.properties[0].flow_vol)
+    
+    # Energy costing
+    energy_costing_block.cost_process()
+
+    # System costing
+    m.fs.costing = REFLOSystemCosting()
+    m.fs.costing.heat_cost_buy.fix(heat_price)
+    m.fs.costing.electricity_cost_buy.set_value(electricity_price)
+    m.fs.costing.cost_process()
+
+    print("\n--------- INITIALIZING SYSTEM COSTING ---------\n")
+
+    treatment_costing_block.initialize()
+    energy_costing_block.initialize()
+    m.fs.costing.initialize()
+
     m.fs.costing.add_annual_water_production(
         m.fs.treatment.product.properties[0].flow_vol
     )
@@ -170,55 +315,15 @@ def add_costing(m, treatment_costing_block=None, energy_costing_block=None):
     m.fs.costing.add_LCOH()
 
 
-def calc_costing(m, heat_price=0.01, electricity_price=0.07):
-    # Touching variables to solve for volumetric flow rate
-    m.fs.product.properties[0].flow_vol_phase
-
-    # Treatment costing
-    # Overwriting values in yaml
-    m.fs.treatment.costing.heat_cost.fix(heat_price)
-    m.fs.treatment.costing.electricity_cost.fix(electricity_price)
-    m.fs.treatment.costing.cost_process()
-
-    m.fs.treatment.costing.initialize()
-
-    m.fs.treatment.costing.add_annual_water_production(
-        m.fs.product.properties[0].flow_vol
-    )
-    m.fs.treatment.costing.add_LCOW(m.fs.product.properties[0].flow_vol)
-
-    # Energy costing
-    m.fs.energy.costing.electricity_cost.fix(electricity_price)
-    m.fs.energy.costing.cost_process()
-
-    m.fs.energy.costing.initialize()
-    m.fs.energy.costing.add_annual_water_production(m.fs.product.properties[0].flow_vol)
-    m.fs.energy.costing.add_LCOH()
-
-
-def add_constraints(m):
-    treatment = m.fs.treatment
-
-    m.fs.water_recovery = Var(
-        initialize=m.water_recovery,
-        bounds=(0, 0.99),
-        domain=NonNegativeReals,
-        units=pyunits.dimensionless,
-        doc="System Water Recovery",
-    )
-
-    m.fs.eq_water_recovery = Constraint(
-        expr=treatment.feed.properties[0].flow_vol * m.fs.water_recovery
-        == treatment.product.properties[0].flow_vol
-    )
-
-
-def set_scaling(m):
+def apply_scaling(m):
 
     m.fs.properties.set_default_scaling(
         "flow_mass_phase_comp", 0.1, index=("Liq", "H2O")
     )
     m.fs.properties.set_default_scaling("flow_mass_phase_comp", 1, index=("Liq", "TDS"))
+
+    set_scaling_factor(m.fs.energy.FPC.heat_annual, 1e-5)
+    set_scaling_factor(m.fs.energy.FPC.electricity_annual, 1e-4)
 
     calculate_scaling_factors(m)
 
@@ -254,29 +359,31 @@ def init_system(m, blk, verbose=True, solver=None):
 
     treatment.feed.initialize()
 
-    init_md(treatment.md)
+    init_md(m, treatment.md)
 
     propagate_state(treatment.md_to_product)
     treatment.product.initialize()
 
     propagate_state(treatment.md_to_dwi)
-    # m.fs.disposal.initialize()
 
     init_DWI(m, blk.treatment.dwi, verbose=True, solver=None)
 
     init_fpc(m.fs.energy)
 
 
-def solve(m, solver=None, tee=True, raise_on_failure=True):
+def solve(
+    m, solver=None, tee=False, raise_on_failure=True, symbolic_solver_labels=True
+):
     # ---solving---
     if solver is None:
         solver = get_solver()
-    # solver.options["max_iter"] = 5000
-    # solver.options["halt_on_ampl_error"] = "yes"
 
-    print("\n--------- SOLVING ---------\n")
+    solver.options["max_iter"] = 1000
+    solver.options["halt_on_ampl_error"] = "yes"
 
-    results = solver.solve(m, tee=tee)
+    print(f"\n--------- SOLVING {m.name} ---------\n")
+
+    results = solver.solve(m, tee=tee, symbolic_solver_labels=True)
 
     if check_optimal_termination(results):
         print("\n--------- OPTIMAL SOLVE!!! ---------\n")
@@ -292,11 +399,6 @@ def solve(m, solver=None, tee=True, raise_on_failure=True):
     else:
         print(msg)
         return results
-
-
-def optimize(m):
-    m.fs.costing.frac_heat_from_grid.unfix()
-    m.fs.obj = Objective(expr=m.fs.costing.LCOT)
 
 
 def report_costing(blk):
@@ -334,9 +436,9 @@ def report_costing(blk):
         f'{"Heat purchased":<30s}{value(blk.aggregate_flow_heat_purchased):<20,.2f}{pyunits.get_units(blk.aggregate_flow_heat_purchased)}'
     )
 
-    print(
-        f'{"Heat sold":<30s}{value(blk.aggregate_flow_heat_sold):<20,.2f}{pyunits.get_units(blk.aggregate_flow_heat_sold)}'
-    )
+    # print(
+    #     f'{"Heat sold":<30s}{value(blk.aggregate_flow_heat_sold):<20,.2f}{pyunits.get_units(blk.aggregate_flow_heat_sold)}'
+    # )
 
     print(
         f'{"Elec Flow":<30s}{value(blk.aggregate_flow_electricity):<20,.2f}{pyunits.get_units(blk.aggregate_flow_electricity)}'
@@ -350,39 +452,9 @@ def report_costing(blk):
         f'{"Elec purchased":<30s}{value(blk.aggregate_flow_electricity_purchased):<20,.2f}{pyunits.get_units(blk.aggregate_flow_electricity_purchased)}'
     )
 
-    print(
-        f'{"Elec sold":<30s}{value(blk.aggregate_flow_electricity_sold):<20,.2f}{pyunits.get_units(blk.aggregate_flow_electricity_sold)}'
-    )
-
-
-def main(
-    water_recovery=0.5,
-    heat_price=0.07,
-    electricity_price=0.07,
-    frac_heat_from_grid=0.01,
-    hours_storage=8,
-    run_optimization=True,
-):
-    # Build  MD, DWI and FPC
-    m = build_system()
-    add_connections(m)
-    add_constraints(m)
-    set_operating_conditions(m)
-    set_scaling(m)
-    # check_jac(m)
-    init_system(m, m.fs)
-    print(f"dof = {degrees_of_freedom(m)}")
-    results = solve(m.fs.treatment.md.mp)
-    # results = solve(m.fs.treatment.md)
-    # results = solve(m.fs.treatment)
-    # results = solve(m.fs.energy)
-    results = solve(m)
-    print(f"termination {results.solver.termination_condition}")
-    add_costing(m)
-
-    print(f"dof = {degrees_of_freedom(m)}")
-    results = solve(m)
-    print(f"termination 2 {results.solver.termination_condition}")
+    # print(
+    #     f'{"Elec sold":<30s}{value(blk.aggregate_flow_electricity_sold):<20,.2f}{pyunits.get_units(blk.aggregate_flow_electricity_sold)}'
+    # )
 
 
 def print_results_summary(m):
@@ -412,11 +484,32 @@ def print_results_summary(m):
     report_MD(m, m.fs.treatment.md)
     report_md_costing(m, m.fs.treatment)
 
-    print_DWI_costing_breakdown(m.fs.treatment, m.fs.treatment.dwi)
+    print_DWI_costing_breakdown(m.fs.treatment.dwi)
 
-    report_fpc(m, m.fs.energy.fpc.unit)
-    report_fpc_costing(m, m.fs.energy)
+    report_fpc(m)
+    # print_FPC_costing_breakdown(m, m.fs.energy.costing.flat_plate)
+
     report_costing(m.fs.costing)
+
+    energy = m.fs.energy
+    treatment = m.fs.treatment
+
+    print(
+        f'{"Fixed Op. Cost by Capacity":<30s}{value(energy.costing.flat_plate.fixed_operating_by_capacity):<20,.2f}{pyunits.get_units(energy.costing.flat_plate.fixed_operating_by_capacity)}'
+    )
+    print(
+        f'{"Cost Per Collector Area":<30s}{value(energy.costing.flat_plate.cost_per_area_collector):<20,.2f}{pyunits.get_units(energy.costing.flat_plate.cost_per_area_collector)}'
+    )
+    print(
+        f'{"Cost Per Volume Storage":<30s}{value(energy.costing.flat_plate.cost_per_volume_storage):<20,.2f}{pyunits.get_units(energy.costing.flat_plate.cost_per_volume_storage)}'
+    )
+    print(
+        f'{"Cost Per Land":<30s}{value(energy.costing.flat_plate.land_cost_per_acre):<20,.2f}{pyunits.get_units(energy.costing.flat_plate.land_cost_per_acre)}'
+    )
+
+    print(
+        f'{"DWI LCOW":<30s}{value(treatment.costing.deep_well_injection.dwi_lcow):<20,.2f}{pyunits.get_units(treatment.costing.deep_well_injection.dwi_lcow)}'
+    )
 
 
 def save_results(m):
@@ -568,11 +661,16 @@ def save_results(m):
 
 if __name__ == "__main__":
 
-    main(
-        water_recovery=0.8,
-        heat_price=0.08,
-        electricity_price=0.07,
-        frac_heat_from_grid=0.5,
-        hours_storage=6,
-        run_optimization=False,
-    )
+
+    m = main(
+        water_recovery=0.4,
+        heat_price=0.0166,
+        electricity_price=0.04989,
+        grid_frac_heat=1,
+        hours_storage=24,
+        cost_per_area_collector=600,
+        cost_per_volume_storage=2000,
+        dwi_lcow = 0.0587
+        )
+    
+    print_results_summary(m)

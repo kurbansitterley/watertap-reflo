@@ -11,3 +11,5 @@
 #################################################################################
 
 from .photovoltaic_zo import Photovoltaic
+from .flat_plate_pysam import FlatPlatePySAM
+from .trough_pysam import TroughPySAM

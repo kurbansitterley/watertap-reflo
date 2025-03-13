@@ -70,7 +70,6 @@ def propagate_state(arc, detailed=True):
 
 
 def main():
-    file_dir = os.path.dirname(os.path.abspath(__file__))
 
     m = build_system()
     add_connections(m)
@@ -79,13 +78,14 @@ def main():
     apply_scaling(m)
     init_system(m)
     add_costing(m)
-    optimize(m, ro_mem_area=None, water_recovery=0.6)
+    optimize(m, ro_mem_area=None, water_recovery=0.75)
     solve(m, debug=True)
+    report_UF(m, m.fs.UF)
 
-    print(m.fs.treatment.product.display())
-    print(m.fs.treatment.product.properties[0].flow_vol_phase.display())
-    print(m.fs.treatment.costing.display())
-    print(m.fs.treatment.costing.LCOW.display())
+    # print(m.fs.treatment.product.display())
+    # print(m.fs.treatment.product.properties[0].flow_vol_phase.display())
+    # print(m.fs.treatment.costing.display())
+    # print(m.fs.treatment.costing.LCOW.display())
 
 
 def build_system():
@@ -189,7 +189,7 @@ def build_sweep():
     init_system(m)
     add_costing(m)
     display_system_build(m)
-    optimize(m, ro_mem_area=None, water_recovery=0.6)
+    optimize(m, ro_mem_area=None, water_recovery=0.75)
 
     return m
 
@@ -277,7 +277,9 @@ def apply_scaling(m):
 def add_costing(m):
     treatment = m.fs.treatment
     # treatment.costing = TreatmentCosting()
-    treatment.costing = REFLOCosting()
+    treatment.costing = TreatmentCosting()
+    elec_cost = pyunits.convert(0.066 * pyunits.USD_2023, to_units=pyunits.USD_2018)()
+    treatment.costing.electricity_cost.fix(elec_cost)
 
     # energy = m.fs.energy = Block()
     # energy.costing = EnergyCosting()
@@ -533,7 +535,7 @@ def solve(model, solver=None, tee=False, raise_on_failure=True, debug=False):
             print("\n--------- INFEASIBLE BOUNDS ---------\n")
             print_infeasible_bounds(model)
 
-            print("\n--------- CHECKING JACOBIAN ---------\n")
+            # print("\n--------- CHECKING JACOBIAN ---------\n")
         return results
     msg = (
         "The current configuration is infeasible. Please adjust the decision variables."
