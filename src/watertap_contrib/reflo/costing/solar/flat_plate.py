@@ -1,5 +1,5 @@
 #################################################################################
-# WaterTAP Copyright (c) 2020-2023, The Regents of the University of California,
+# WaterTAP Copyright (c) 2020-2025, The Regents of the University of California,
 # through Lawrence Berkeley National Laboratory, Oak Ridge National Laboratory,
 # National Renewable Energy Laboratory, and National Energy Technology
 # Laboratory (subject to receipt of any required approvals from the U.S. Dept.
@@ -23,7 +23,7 @@ def build_flat_plate_cost_param_block(blk):
     costing = blk.parent_block()
 
     blk.cost_per_area_collector = pyo.Var(
-        initialize=600,
+        initialize=600, # 372 $/m2 from SEDAT
         units=costing.base_currency / pyo.units.m**2,
         bounds=(0, None),
         doc="Cost per area for solar collector",
@@ -75,6 +75,7 @@ def cost_flat_plate(blk):
     flat_plate_params = blk.costing_package.flat_plate
     flat_plate = blk.unit_model
     make_capital_cost_var(blk)
+    blk.costing_package.add_cost_factor(blk, None)
     make_fixed_operating_cost_var(blk)
 
     blk.direct_capital_cost = pyo.Var(
