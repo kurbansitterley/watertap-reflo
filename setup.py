@@ -15,7 +15,7 @@ setup(
         # "watertap @ https://github.com/watertap-org/watertap/archive/main.zip", # uncomment if we need to point to main mid release cycle
         "watertap>=1.6.0",
         "idaes-pse>=2.8.0",
-        "pyomo>=6.6.1",
+        "pyomo>=6.10.0",
         "nrel-pysam>=7.0.0",
         "pint<0.25",
         "requests>=2.32",
