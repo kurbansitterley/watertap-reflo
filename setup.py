@@ -10,7 +10,7 @@ setup(
     packages=find_namespace_packages(where="src"),
     package_dir={"": "src"},
     author="WaterTAP-REFLO contributors",
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     install_requires=[
         # "watertap @ https://github.com/watertap-org/watertap/archive/main.zip", # uncomment if we need to point to main mid release cycle
         "watertap==1.6.0",
