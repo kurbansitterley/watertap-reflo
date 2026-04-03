@@ -13,7 +13,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         # "watertap @ https://github.com/watertap-org/watertap/archive/main.zip", # uncomment if we need to point to main mid release cycle
-        "watertap==1.6.0",
+        "watertap>=1.6.0",
         "idaes-pse>=2.8.0",
         "pyomo>=6.6.1",
         "nrel-pysam>=7.0.0",
